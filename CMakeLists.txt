@@ -23,6 +23,8 @@ endif()
 set(NFSCARBON_SOURCES
     src/main.cpp
     src/dispatch_tolerance.cpp
+    # carbon_60fps (experimental, off): lifts the game's 30 fps frame limiter (docs/60fps.md).
+    src/frame_rate_hook.cpp
 )
 
 if(WIN32)
@@ -62,6 +64,14 @@ if(WIN32)
 endif()
 
 rexglue_setup_target(nfscarbon GPU_PLUGINS xenos)
+
+# The frame limiter function for carbon_60fps once it is found
+# (tools/find_60fps.py; 8 hex digits, e.g. 8236ABCD), else only data patches.
+set(NFSCARBON_FPS_LIMITER_FUNC "" CACHE STRING
+    "Address of Carbon's SetFPSLimiter(float fps) for the carbon_60fps hook (docs/60fps.md)")
+if(NFSCARBON_FPS_LIMITER_FUNC)
+    target_compile_definitions(nfscarbon PRIVATE NFSCARBON_FPS_LIMITER_FUNC=${NFSCARBON_FPS_LIMITER_FUNC})
+endif()
 
 # Native Direct3D 12 renderer next to the Xenos emulation (--native_renderer),
 # ported from NFSMW-Recompiled_ff (GPL-3.0, see src/native and

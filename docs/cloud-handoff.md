@@ -97,3 +97,42 @@ To do:
 `tools/native-port/run_menu.ps1` starts the game with the native renderer, sends key presses and saves
 the native frame (`NATIVE_SAVE_FRONT`). Main menu: `-Keys "ESC@20","ESC@26"`. Before testing rename
 `game/Movies` to `Movies.bak` (skips the intros), and rename it back afterwards.
+
+## Results of the cloud session (2026-10-13)
+
+Branch `claude/cloud-handoff-tasks-09ioid`, based on `native-d3d12-wip`. Nothing was built or run with the game.
+
+**Task 1 (60 fps):**
+
+- Written up in `docs/60fps.md`. No platform has a public 60 fps patch for Carbon: not Xenia (the repo's only
+  Carbon file was removed in 2023), RPCS3, PCSX2 or Dolphin.
+- The engine steps the simulation at a fixed 1/60 s (MW decomp, Carbon PC WidescreenFix), so 30 fps on the
+  console means 2 steps per frame. Only the limiter has to go.
+- Most likely it is `SetFPSLimiter(30)` / `LimitMinimumVideoTimeElapsed`, which is time-based and fits the
+  measurement.
+- Prepared:
+  - `tools/find_60fps.py` lists the candidates in a `guest_image.bin`.
+  - `src/frame_rate_hook.cpp` adds the cvars `carbon_60fps` (default off) and `carbon_60fps_patches`
+    (verified data patches) and the CMake option `NFSCARBON_FPS_LIMITER_FUNC` (function hook).
+  - The launcher passes `carbon_60fps` with its 60 fps setting.
+- **Next:** dump the image, run the finder, enter the address.
+
+**Task 2 (native renderer):**
+
+1. **`NATIVE_STREAM_STATE=1|2|3`.** The recorder lays the register writes of the command buffer over the
+   shadow. Done in `port_parallel.py`; `parallel.cpp` was regenerated and is otherwise unchanged. The audit
+   now shares the walker, which fixes the reading of `SET_CONSTANT2` and adds the other packets.
+2. **Formats in `renderer.cpp`:**
+   - the fixed-16 render targets get the SDK's ÷32;
+   - resolves keep the copy's format (float/HDR were clamped as R8G8B8A8) and its exponent bias; the
+     write-back handles 4/8-byte formats; `NATIVE_RESOLVE_RGBA8=1` gives the old behaviour;
+   - 14 more texture formats, among them DXN, DXT5A and the `_AS_16_16_16_16` variants;
+   - still missing: 24_8, 10_11_11, 11_11_10 and CTX1.
+3. **`docs/native-d3d12-port.md` updated.**
+
+**Testing on the PC:**
+
+1. The build: the renderer could not be compiled here (no D3D12/SDK headers); `parallel.cpp` and
+   `frame_rate_hook.cpp` were checked against stub headers.
+2. Main menu and a race with and without `NATIVE_STREAM_STATE=1` and `=3`, with `NATIVE_SAVE_FRONT`.
+3. The `[native stream state]` lines and `unsupported texture: format N` in the log.

@@ -787,6 +787,10 @@ QStringList LauncherWindow::buildArguments(const QString& gameDir) const {
   if (targetFps() > 30) {
     a << opt("guest_vblank_rate", "1000");
   }
+  // The game's own 30 fps limiter (src/frame_rate_hook.cpp, docs/60fps.md):
+  // lifted once its address is set (carbon_60fps_patches in nfscarbon.toml or
+  // a build with NFSCARBON_FPS_LIMITER_FUNC); without one it only logs that.
+  a << flag("carbon_60fps", targetFps() > 30);
   a << opt("frame_pacing_fps", QString::number(targetFps()));
   a << opt("max_fps", "0");
 
