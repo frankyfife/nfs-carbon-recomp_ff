@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased (2026-10-13): PC build for the EU Collector's Edition, Xenos default, launcher
+
+- **Function hints for the EU Collector's Edition XEX** (title 454107EC, media ID 5E74E60D). Its
+  code is laid out differently from the XEX the previous 380 hints were collected on: those hints
+  pointed into the middle of functions and broke codegen. `nfscarbon_manifest.toml` now holds
+  hints from a scan of the loaded image (vtables and code addresses built with `lis`/`addi`,
+  minus jump tables, import thunks and the register save/restore helpers), pruned until codegen
+  emits no new `REX_FATAL` stubs. The image is dumped with `REX_DUMP_GUEST_IMAGE=1`
+  (`src/dispatch_tolerance.cpp`, 15 s after start, to `guest_image.bin`). A 3-minute run logged
+  no unregistered indirect calls.
+- **Windows defaults to the Xenos GPU plugin (Direct3D 12).** The native Vulkan renderer misses
+  car reflections (cube faces are resolved but never sampled), several effects, and renders at
+  720p. Android keeps the native renderer.
+- **SDK patch `patches/rexglue-nfsmw-ff-pc.patch`**, applied after the other patches: the SDK
+  changes of the NFS Most Wanted ff fork (`parche_ff.py` and its nine smaller patches). Among them:
+  V-Sync that actually syncs in the D3D12 presenter (it passed `SyncInterval` 0: tearing), frame
+  pacing (`frame_pacing_*`, `guest_vblank_rate`, `max_fps`), the XMA stall fixes, the F4 overlay
+  improvements, `gpu_backend`, WARP fallback and `log_guest_fps` statistics. Three pacing blocks
+  were ported by hand where Carbon's own vblank patch differs; the shared-memory hot-pages blocks
+  were left out (they conflict with the census patch).
+- **Frame rate finding:** Carbon holds 30 fps in its own code. With a guest vblank every
+  millisecond and a 60 fps target the game thread still idles about 31 ms per frame, unlike Most
+  Wanted. 60 fps needs a game-side change.
+- **Qt launcher** (`launcher-windows/`, GPL-3.0, adapted from the NFS Most Wanted ff launcher; see
+  its README).
+
 ## 0.3.3 (2026-10-07): downloaded turnip drivers, new settings, redundant resolve skipping
 
 - **Redundant resolves are skipped** (`carbon_gpu_skip_redundant_resolves`, default on). Every render target

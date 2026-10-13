@@ -96,10 +96,16 @@ class NfsCarbonApp : public rex::ReXApp {
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
     // "carbon" is the native renderer (renderer/); "xenos" the SDK's Xenos
-    // emulation, kept as a fallback selectable with gpu_plugin in the TOML
-    // (the Android launcher writes it from Settings > Renderer).
+    // emulation. On Android the native renderer is the default (the launcher
+    // writes gpu_plugin from Settings > Renderer). On Windows Xenos (Direct3D
+    // 12) is: the native renderer still misses car reflections and other
+    // effects there, and the PC has the headroom for the emulation.
     if (config.gpu_plugin.empty()) {
+#if defined(__ANDROID__)
       config.gpu_plugin = "carbon";
+#else
+      config.gpu_plugin = "xenos";
+#endif
     }
 
 #if defined(__ANDROID__)

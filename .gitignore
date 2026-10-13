@@ -34,3 +34,8 @@ android/local.properties
 
 # Frame dumps from carbon_gpu_dump_frame_interval
 carbon_frames/
+
+# Qt launcher (launcher-windows/build.ps1) and its runtime files
+launcher-windows/out/
+launcher.ini
+game_root_cache/
