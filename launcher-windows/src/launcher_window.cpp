@@ -70,9 +70,12 @@ const QList<int> kAnisoValues = {0, 2, 3, 4, 5};
 // carbon_gpu_max_anisotropy (native Vulkan renderer): the sample count.
 const QList<int> kAnisoSamples = {1, 2, 4, 8, 16};
 const QStringList kFilterValues = {"bilinear", "cas", "fsr"};
-// gpu_plugin: the SDK's Xenos emulation (Direct3D 12) or this project's
-// native Vulkan renderer (renderer/).
-const QStringList kRendererValues = {"xenos", "carbon"};
+// The renderer: the SDK's Xenos emulation (Direct3D 12), the native Direct3D
+// 12 renderer next to it (src/native, ported from NFS Most Wanted ff; the
+// Xenos plugin still runs the command stream), or the native Vulkan renderer
+// (renderer/, gpu_plugin "carbon").
+const QStringList kRendererValues = {"xenos", "native", "carbon"};
+enum { kRendererXenos, kRendererNative, kRendererVulkan };
 
 QLabel* note(const QString& text = QString()) {
   auto* l = new QLabel(text);
@@ -400,8 +403,8 @@ QWidget* LauncherWindow::buildContent() {
 
   // ---- Renderer (first in the column: it decides the picture) ----
   auto* rendererCard = new Card(QStringLiteral("Renderer"));
-  renderer_ = new Segmented({QStringLiteral("Xenos · Direct3D 12"),
-                             QStringLiteral("Native Vulkan")});
+  renderer_ = new Segmented({QStringLiteral("Xenos · D3D12"), QStringLiteral("Native · D3D12"),
+                             QStringLiteral("Native · Vulkan")});
   rendererCard->addRow(QStringLiteral("Graphics"), renderer_);
   rendererNote_ = note();
   rendererCard->grid()->addWidget(rendererNote_, rendererCard->grid()->rowCount(), 0, 1, 2);
@@ -741,19 +744,28 @@ QStringList LauncherWindow::buildArguments(const QString& gameDir) const {
   a << opt("log_level", "info");
   a << opt("log_file", QDir::toNativeSeparators(runLog_));
   a << opt("game_data_root", QDir::toNativeSeparators(gameDir));
-  const bool xenos = renderer_->currentIndex() == 0;
-  a << opt("gpu_plugin", kRendererValues[renderer_->currentIndex()]);
+  const int renderer = renderer_->currentIndex();
+  const int scale = scale_->currentIndex() + 1;
+  a << opt("gpu_plugin", renderer == kRendererVulkan ? "carbon" : "xenos");
   a << flag("mnk_mode", true);
   // Always passed: the command line wins over nfscarbon.toml (an API picked in
-  // the F4 menu cannot lock it out). The Xenos plugin is Direct3D 12 here; the
-  // native renderer is Vulkan regardless.
+  // the F4 menu cannot lock it out). The Xenos plugin and the native Direct3D
+  // 12 renderer need Direct3D 12; the native Vulkan renderer is Vulkan
+  // regardless.
   a << opt("gpu_backend", "d3d12");
+  // The native Direct3D 12 renderer draws the frames; the emulation skips its
+  // draws once the native picture is shown.
+  a << flag("native_renderer", renderer == kRendererNative);
 
   a << opt("resolution", outputResolution());
-  // The internal scale: Xenos draws at that multiple of the game's 1280x720
-  // (supersampling). The native renderer stays at 1x (its scale is tuned for
-  // phones and only goes down).
-  a << opt("resolution_scale", QString::number(xenos ? scale_->currentIndex() + 1 : 1));
+  // The internal scale (supersampling, multiples of the game's 1280x720): the
+  // emulation's for Xenos, the native renderer's for native Direct3D 12 (the
+  // emulation then draws nothing and stays at 1x). The native Vulkan renderer
+  // stays at 1x (its scale is tuned for phones and only goes down).
+  a << opt("resolution_scale", QString::number(renderer == kRendererXenos ? scale : 1));
+  if (renderer == kRendererNative) {
+    a << opt("native_renderer_scale", QString::number(scale));
+  }
   a << flag("fullscreen", mode_->currentIndex() == 0);
   a << opt("monitor", QString::number(std::max(0, monitor_->currentIndex())));
 
@@ -781,6 +793,7 @@ QStringList LauncherWindow::buildArguments(const QString& gameDir) const {
   a << opt("swap_post_effect", "none");
   a << opt("anisotropic_override", QString::number(kAnisoValues[aniso_->currentIndex()]));
   a << opt("carbon_gpu_max_anisotropy", QString::number(kAnisoSamples[aniso_->currentIndex()]));
+  a << opt("native_renderer_anisotropic", QString::number(kAnisoValues[aniso_->currentIndex()]));
   // Advanced tab (see buildAdvanced for what each one does).
   a << flag("frame_pacing_at_guest", pacingAtGuest_->isChecked());
   a << flag("frame_pacing_low_latency", lowLatency_->isChecked());
@@ -826,10 +839,10 @@ void LauncherWindow::refresh() {
   width_->setEnabled(custom);
   height_->setEnabled(custom);
 
-  const bool xenos = renderer_->currentIndex() == 0;
+  const int renderer = renderer_->currentIndex();
   const int scale = scale_->currentIndex() + 1;
-  scale_->setEnabled(xenos);
-  if (!xenos) {
+  scale_->setEnabled(renderer != kRendererVulkan);
+  if (renderer == kRendererVulkan) {
     setNote(scaleNote_, QStringLiteral("The native Vulkan renderer draws at the Xbox 360's "
                                        "1280 × 720."));
   } else if (scale == 1) {
@@ -843,10 +856,16 @@ void LauncherWindow::refresh() {
                 .arg(scale * scale),
             "hot");
   }
-  if (xenos) {
+  if (renderer == kRendererXenos) {
     setNote(rendererNote_,
             QStringLiteral("The Xbox 360 GPU emulated on Direct3D 12: the complete picture, "
                            "with car reflections and every effect. Recommended."));
+  } else if (renderer == kRendererNative) {
+    setNote(rendererNote_,
+            QStringLiteral("Experimental: the game's draws recorded and drawn by a Direct3D 12 "
+                           "renderer of its own (from the NFS Most Wanted port), much less work "
+                           "per frame than the emulation. Verified on the title screen so far."),
+            "warn");
   } else {
     setNote(rendererNote_,
             QStringLiteral("Draws the game with Vulkan directly (made for phones). Faster, but "

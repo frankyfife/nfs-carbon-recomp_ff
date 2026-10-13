@@ -63,6 +63,55 @@ endif()
 
 rexglue_setup_target(nfscarbon GPU_PLUGINS xenos)
 
+# Native Direct3D 12 renderer next to the Xenos emulation (--native_renderer),
+# ported from NFSMW-Recompiled_ff (GPL-3.0, see src/native and
+# docs/native-d3d12-port.md). It compiles the SDK's Xenos shader translator in
+# from the SDK source tree (the GPU plugin does not export it); its cvars stay
+# local (src/native/sdk_cvars_local.h) so the plugin's own settings keep working.
+set(NFSCARBON_SDK_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../reference/rexglue-sdk" CACHE PATH
+    "rexglue-sdk source tree, for the native Direct3D 12 renderer")
+option(NFSCARBON_NATIVE_D3D12 "Build the native Direct3D 12 renderer (Windows)" ON)
+if(WIN32 AND NFSCARBON_NATIVE_D3D12 AND
+   EXISTS "${NFSCARBON_SDK_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator.cpp")
+    set(SDK_GPU "${NFSCARBON_SDK_SOURCE_DIR}/src/graphics")
+    set(NATIVE_SDK_SOURCES
+        ${SDK_GPU}/flags.cpp
+        ${SDK_GPU}/registers.cpp
+        ${SDK_GPU}/register_file.cpp
+        ${SDK_GPU}/format/ucode.cpp
+        ${SDK_GPU}/util/draw.cpp
+        ${SDK_GPU}/pipeline/shader/shader.cpp
+        ${SDK_GPU}/pipeline/shader/translator.cpp
+        ${SDK_GPU}/pipeline/shader/translator_disasm.cpp
+        ${SDK_GPU}/pipeline/shader/dxbc.cpp
+        ${SDK_GPU}/pipeline/shader/dxbc_translator.cpp
+        ${SDK_GPU}/pipeline/shader/dxbc_translator_alu.cpp
+        ${SDK_GPU}/pipeline/shader/dxbc_translator_fetch.cpp
+        ${SDK_GPU}/pipeline/shader/dxbc_translator_memexport.cpp
+        ${SDK_GPU}/pipeline/shader/dxbc_translator_om.cpp
+    )
+    target_sources(nfscarbon PRIVATE
+        src/native/parallel.cpp
+        src/native/renderer.cpp
+        src/native/sdk_globals.cpp
+        ${NATIVE_SDK_SOURCES}
+        ${NFSCARBON_SDK_SOURCE_DIR}/thirdparty/dxbc/DXBCChecksum.cpp
+    )
+    set_source_files_properties(${NATIVE_SDK_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/src/native/sdk_cvars_local.h;-Wno-unused-variable"
+        SKIP_PRECOMPILE_HEADERS ON)
+    set_source_files_properties(src/native/parallel.cpp src/native/renderer.cpp PROPERTIES
+        COMPILE_OPTIONS "-gline-tables-only")
+    set_source_files_properties(${NFSCARBON_SDK_SOURCE_DIR}/thirdparty/dxbc/DXBCChecksum.cpp PROPERTIES
+        COMPILE_OPTIONS "-w" SKIP_PRECOMPILE_HEADERS ON)
+    target_include_directories(nfscarbon PRIVATE
+        src/native ${NFSCARBON_SDK_SOURCE_DIR} ${NFSCARBON_SDK_SOURCE_DIR}/thirdparty/renderdoc)
+    target_link_libraries(nfscarbon PRIVATE d3d12 dxgi dxguid d3dcompiler windowscodecs ole32)
+    message(STATUS "Native D3D12 renderer: on (SDK source ${NFSCARBON_SDK_SOURCE_DIR})")
+else()
+    message(STATUS "Native D3D12 renderer: off")
+endif()
+
 if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
     # libadrenotools (BSD-2-Clause). Its hook libraries (libhook_impl.so, libmain_hook.so,
     # libfile_redirect_hook.so, libgsl_alloc_hook.so) must be copied into jniLibs/arm64-v8a.
