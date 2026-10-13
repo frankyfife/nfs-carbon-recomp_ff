@@ -158,16 +158,17 @@ r('''      // (dev, prim, start, count): every stream of the vertex declaration,
           continue;
         }''',
   '''      // (dev, prim, start, count): every bound stream, stream s through fetch
-      // constant 95 - s (its shadow at device +1784 - 8 s), stride at device
-      // +12248 + s. (The vertex declaration's stream count is not read: a
-      // stream left bound from an earlier draw only costs a copy.)
+      // constant 95 - s (as recorded for the draw: the shadow's at device
+      // +1784 - 8 s, with NATIVE_STREAM_STATE the command buffer's), stride
+      // at device +12248 + s. (The vertex declaration's stream count is not
+      // read: a stream left bound from an earlier draw only costs a copy.)
       const uint64_t start = args[2], count = args[3];
       for (uint32_t s = 0; s < 16; ++s) {
         if (!LoadBE32(device + kDeviceStreamBuffers + 4 * s)) {
           continue;
         }
-        const uint32_t d0 = LoadBE32(device + kDeviceFetch95 - 8 * s);
-        const uint32_t d1 = LoadBE32(device + kDeviceFetch95 - 8 * s + 4);
+        const uint32_t d0 = _byteswap_ulong(last_shadow_[kFetch95Flat - 2 * s]);
+        const uint32_t d1 = _byteswap_ulong(last_shadow_[kFetch95Flat - 2 * s + 1]);
         const uint64_t stride = uint64_t(device[kDeviceStreamStrides + s]) * 4;
         if (!(d0 & 0x1FFFFFFC) || !stride) {
           continue;
@@ -604,7 +605,10 @@ r("""  void RecordOcclusion(const uint32_t* addresses, uint32_t count);""",
   """  void RecordOcclusion(const uint32_t* addresses, uint32_t count);
   void AuditStream(const uint8_t* base, uint32_t device, uint32_t from, uint32_t to,
                    bool at_draw);
-  void LogAudit();""")
+  void LogAudit();
+  void StreamWalk(const uint8_t* base, uint32_t from, uint32_t to, bool for_item);
+  void StreamItemStart();
+  void LogStreamState();""")
 r("""namespace {
 
 // Calls a hooked entry point and records it (MW: render_census.cpp).
@@ -625,8 +629,21 @@ void RecordCall(int entry, PPCContext& ctx, uint8_t* base) {
   """namespace {
 
 const bool g_stream_audit = std::getenv("NATIVE_STREAM_AUDIT") != nullptr;
-// The last command buffer dword the audit walked (this thread).
+// The audit and NATIVE_STREAM_STATE (Parallel::ApplyStreamState) walk the
+// command buffer.
+const bool g_stream_walk = g_stream_audit || std::getenv("NATIVE_STREAM_STATE") != nullptr;
+// The last command buffer dword the walks took (this thread).
 thread_local uint32_t t_audit_position = 0;
+// Inside a recorded draw or resolve: a segment it starts ends part of it.
+thread_local bool t_in_item = false;
+
+void Walk(const uint8_t* base, uint32_t device, uint32_t from, uint32_t to, bool at_draw,
+          bool for_item) {
+  if (g_stream_audit) {
+    Parallel::Get().AuditStream(base, device, from, to, at_draw);
+  }
+  Parallel::Get().StreamWalk(base, from, to, for_item);
+}
 
 // Calls a hooked entry point and records it (MW: render_census.cpp).
 template <void (*Original)(PPCContext&, uint8_t*)>
@@ -638,28 +655,38 @@ void RecordCall(int entry, PPCContext& ctx, uint8_t* base) {
   const uint32_t args[8] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
                             ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32};
   const uint32_t device = args[0];
-  if (g_stream_audit && entry == kEntrySegment && t_audit_position) {
+  const bool draw = entry == kEntryDrawIndexed || entry == kEntryDrawVertices ||
+                    entry == kEntryBeginVertices;
+  const bool item = draw || entry == kEntryResolve;
+  if (g_stream_walk && entry == kEntrySegment && t_audit_position) {
     // The rest of the segment that ends now.
-    Parallel::Get().AuditStream(base, device, t_audit_position,
-                                LoadBE32(base + device + kDeviceWritePointer), false);
+    Walk(base, device, t_audit_position, LoadBE32(base + device + kDeviceWritePointer), false,
+         t_in_item);
     t_audit_position = 0;
+  }
+  if (g_stream_walk && item) {
+    Parallel::Get().StreamItemStart();
+    t_in_item = true;
   }
   Parallel::Get().Before(entry, args, base);
   Original(ctx, base);
-  Parallel::Get().Record(entry, args, ctx.r3.u32, base);
-  if (g_stream_audit) {
+  if (g_stream_walk) {
     if (entry == kEntrySegment) {
       t_audit_position = ctx.r3.u32;
     } else {
       const uint32_t now = LoadBE32(base + device + kDeviceWritePointer);
       if (t_audit_position) {
-        Parallel::Get().AuditStream(base, device, t_audit_position, now,
-                                    entry == kEntryDrawIndexed || entry == kEntryDrawVertices ||
-                                        entry == kEntryBeginVertices);
+        Walk(base, device, t_audit_position, now, draw, item);
       }
       t_audit_position = now;
     }
+    if (item) {
+      t_in_item = false;
+    }
   }
+  // After the walks: with NATIVE_STREAM_STATE the item takes the register
+  // writes they saw.
+  Parallel::Get().Record(entry, args, ctx.r3.u32, base);
 }
 
 }  // namespace""")
@@ -679,11 +706,348 @@ uint32_t ShadowOffset(uint32_t reg) {
   }
   return 0;
 }
+
+constexpr uint16_t kNoFlat = 0xFFFF;
+// Index of every register in the flat shadow (kNoFlat: not in the shadow).
+const std::vector<uint16_t>& FlatIndexOfRegister() {
+  static const std::vector<uint16_t> table = [] {
+    std::vector<uint16_t> t(0x10000, kNoFlat);
+    const auto& registers = ShadowRegisters();
+    for (uint32_t flat = 0; flat < kShadowCount; ++flat) {
+      t[registers[flat]] = uint16_t(flat);
+    }
+    return t;
+  }();
+  return table;
+}
+
+// Device offset of every dword of the flat shadow.
+const std::array<uint16_t, kShadowCount>& ShadowDeviceOffsets() {
+  static const std::array<uint16_t, kShadowCount> table = [] {
+    std::array<uint16_t, kShadowCount> t = {};
+    uint32_t flat = 0;
+    for (const ShadowGroup& g : kShadowGroups) {
+      for (uint32_t i = 0; i < g.count; ++i) {
+        t[flat++] = uint16_t(g.device_offset + 4 * i);
+      }
+    }
+    return t;
+  }();
+  return table;
+}
+
+// What WalkPackets reports.
+enum class StreamEvent {
+  kPacket,    // a packet header
+  kWrite,     // register `reg` set to `value`
+  kModify,    // REG_RMW: reg = (reg & mask) | value
+  kUnknown,   // REG_RMW with register operands: the value is not known
+  kDraw,      // DRAW_INDX(_2)(_BIN)
+  kIndirect,  // INDIRECT_BUFFER(_PFD): commands elsewhere, not followed
+};
+
+// First register of SET_CONSTANT's and LOAD_ALU_CONSTANT's types: ALU, fetch,
+// bool, loop, registers.
+constexpr uint32_t kConstantBase[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
+
+// The packets the D3D library wrote into the command buffer after `from` up
+// to `to` (write pointers: the last dword written), with the register writes
+// as the command processor makes them (the SDK's
+// CommandProcessor::ExecutePacketType*): on(event, reg, value, mask).
+// LOAD_ALU_CONSTANT reads its values from memory now (as the shader load
+// scan does).
+template <typename F>
+void WalkPackets(const uint8_t* base, const uint8_t* physical, uint32_t from, uint32_t to, F&& on) {
+  for (uint32_t p = from + 4, next; p <= to; p = next) {
+    const uint32_t header = LoadBE32(base + p);
+    on(StreamEvent::kPacket, 0, header, 0);
+    switch (header >> 30) {
+      case 0: {
+        // count values for registers from header & 0x7FFF (bit 15: all to it).
+        const uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+        const uint32_t reg = header & 0x7FFF;
+        const bool one_reg = (header >> 15) & 1;
+        for (uint32_t i = 0; i < count && p + 4 + 4 * i <= to; ++i) {
+          on(StreamEvent::kWrite, one_reg ? reg : reg + i, LoadBE32(base + p + 4 + 4 * i), 0);
+        }
+        next = p + 4 * (count + 1);
+        break;
+      }
+      case 1:
+        // Two registers (11 bits each).
+        if (p + 8 <= to) {
+          on(StreamEvent::kWrite, header & 0x7FF, LoadBE32(base + p + 4), 0);
+          on(StreamEvent::kWrite, (header >> 11) & 0x7FF, LoadBE32(base + p + 8), 0);
+        }
+        next = p + 12;
+        break;
+      case 3: {
+        const uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+        const uint32_t opcode = (header >> 8) & 0x7F;
+        next = p + 4 * (count + 1);
+        if (next > to + 4) {
+          break;  // not written completely
+        }
+        auto dword = [&](uint32_t i) { return LoadBE32(base + p + 4 + 4 * i); };
+        switch (opcode) {
+          case 0x22:  // DRAW_INDX
+          case 0x36:  // DRAW_INDX_2
+          case 0x34:  // DRAW_INDX_BIN
+          case 0x35:  // DRAW_INDX_2_BIN
+            on(StreamEvent::kDraw, 0, 0, 0);
+            break;
+          case 0x2D:  // SET_CONSTANT: type << 16 | index, then the values
+            if (count >= 2 && ((dword(0) >> 16) & 0xFF) < 5) {
+              const uint32_t first = kConstantBase[(dword(0) >> 16) & 0xFF] + (dword(0) & 0x7FF);
+              for (uint32_t i = 1; i < count; ++i) {
+                on(StreamEvent::kWrite, first + i - 1, dword(i), 0);
+              }
+            }
+            break;
+          case 0x55:  // SET_CONSTANT2
+          case 0x56:  // SET_SHADER_CONSTANTS: register index, then the values
+            if (count >= 2) {
+              const uint32_t first = dword(0) & 0xFFFF;
+              for (uint32_t i = 1; i < count; ++i) {
+                on(StreamEvent::kWrite, first + i - 1, dword(i), 0);
+              }
+            }
+            break;
+          case 0x2F:  // LOAD_ALU_CONSTANT: address, type << 16 | index, dwords
+            if (count == 3 && physical && ((dword(1) >> 16) & 0xFF) < 5) {
+              const uint32_t address = dword(0) & 0x1FFFFFFC;
+              const uint32_t first = kConstantBase[(dword(1) >> 16) & 0xFF] + (dword(1) & 0x7FF);
+              const uint32_t dwords = dword(2) & 0xFFF;
+              if (uint64_t(address) + dwords * 4ull <= 0x20000000) {
+                for (uint32_t i = 0; i < dwords; ++i) {
+                  on(StreamEvent::kWrite, first + i, LoadBE32(physical + address + 4 * i), 0);
+                }
+              }
+            }
+            break;
+          case 0x21:  // REG_RMW: register | flags, and mask, or mask
+            if (count == 3) {
+              if (dword(0) >> 30) {
+                on(StreamEvent::kUnknown, dword(0) & 0x1FFF, 0, 0);
+              } else {
+                on(StreamEvent::kModify, dword(0) & 0x1FFF, dword(2), dword(1));
+              }
+            }
+            break;
+          case 0x3F:  // INDIRECT_BUFFER
+          case 0x37:  // INDIRECT_BUFFER_PFD
+            on(StreamEvent::kIndirect, 0, 0, 0);
+            break;
+          default:
+            break;
+        }
+        break;
+      }
+      default:  // type 2: no-op
+        next = p + 4;
+        break;
+    }
+  }
+}
+
+const uint8_t* PhysicalMemory() {
+  auto* kernel = rex::system::kernel_state();
+  return kernel && kernel->memory() ? kernel->memory()->physical_membase() : nullptr;
+}
 }  // namespace
+
+// NATIVE_STREAM_STATE=<mask> (1 draws, 2 resolves, 3 both): Carbon's D3D
+// library writes some state into the command buffer only, not into the
+// device's register shadow the recorder reads (NATIVE_STREAM_AUDIT: the vertex
+// fetch constants of the streams 0x48BA-0x48BF, ...). The walks of what it
+// wrote since the previous item (RecordCall) collect the register writes; at
+// the item those up to its last draw packet are laid over the shadow (the
+// later ones are for the next item). A register keeps the command buffer's
+// value until the command buffer writes it again or the shadow changes (a Set
+// call the command buffer did not show yet). Only registers of the shadow
+// groups; NATIVE_STREAM_STATE_REGISTERS=<hex>[-<hex>],... narrows them (for
+// finding out which ones matter).
+void Parallel::StreamItemStart() {
+  if (!stream_state_) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  stream_draw_mark_ = -1;
+}
+
+void Parallel::StreamWalk(const uint8_t* base, uint32_t from, uint32_t to, bool for_item) {
+  if (!stream_state_) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (to < from || to - from > (1u << 20) || stream_writes_.size() > (1u << 20)) {
+    // Not one segment, or no item took the writes: the state is not known.
+    stream_writes_.clear();
+    stream_draw_mark_ = -1;
+    stream_lost_ = true;
+    ++stream_lost_walks_;
+    return;
+  }
+  const auto& flat_of = FlatIndexOfRegister();
+  WalkPackets(base, PhysicalMemory(), from, to,
+              [&](StreamEvent event, uint32_t reg, uint32_t value, uint32_t mask) {
+                switch (event) {
+                  case StreamEvent::kWrite:
+                  case StreamEvent::kModify:
+                  case StreamEvent::kUnknown: {
+                    const uint16_t flat = flat_of[reg & 0xFFFF];
+                    if (flat == kNoFlat) {
+                      ++stream_unshadowed_;
+                    } else if (stream_allowed_[flat]) {
+                      stream_writes_.push_back({flat, uint8_t(event), value, mask});
+                    }
+                    break;
+                  }
+                  case StreamEvent::kDraw:
+                    if (for_item) {
+                      stream_draw_mark_ = int64_t(stream_writes_.size());
+                    }
+                    break;
+                  case StreamEvent::kIndirect:
+                    ++stream_indirect_;
+                    break;
+                  default:
+                    break;
+                }
+              });
+}
+
+void Parallel::ApplyStreamState(Frame& f, const uint8_t* device) {
+  const auto& offsets = ShadowDeviceOffsets();
+  // Values big-endian, as in the shadow and last_shadow_.
+  auto shadow = [&](uint32_t flat) {
+    uint32_t value;
+    std::memcpy(&value, device + offsets[flat], 4);
+    return value;
+  };
+  auto set = [&](uint32_t flat, uint32_t value) {
+    if (last_shadow_[flat] != value) {
+      f.registers.push_back(flat | (1u << 16));
+      f.registers.push_back(value);
+      last_shadow_[flat] = value;
+    }
+  };
+  if (stream_lost_) {
+    // A walk was lost: the shadow's values until the command buffer sets them.
+    for (uint16_t flat : stream_active_) {
+      stream_registers_[flat].active = false;
+      set(flat, shadow(flat));
+    }
+    stream_active_.clear();
+    stream_lost_ = false;
+  }
+  // The writes up to the item's draw packet, in order.
+  const size_t taken = stream_draw_mark_ >= 0
+                           ? std::min(size_t(stream_draw_mark_), stream_writes_.size())
+                           : stream_writes_.size();
+  for (size_t i = 0; i < taken; ++i) {
+    const StreamWrite& w = stream_writes_[i];
+    StreamRegister& r = stream_registers_[w.flat];
+    if (!r.touched) {
+      r.touched = true;
+      r.unknown = false;
+      r.next = r.active ? r.value : shadow(w.flat);
+      stream_touched_.push_back(w.flat);
+    }
+    switch (StreamEvent(w.event)) {
+      case StreamEvent::kWrite:
+        r.next = _byteswap_ulong(w.value);
+        r.unknown = false;
+        break;
+      case StreamEvent::kModify:
+        r.next = _byteswap_ulong((_byteswap_ulong(r.next) & w.mask) | w.value);
+        break;
+      default:
+        r.unknown = true;
+        ++stream_unknown_;
+        break;
+    }
+  }
+  stream_writes_.erase(stream_writes_.begin(), stream_writes_.begin() + taken);
+  stream_draw_mark_ = -1;
+  for (uint16_t flat : stream_touched_) {
+    StreamRegister& r = stream_registers_[flat];
+    r.touched = false;
+    const uint32_t now = shadow(flat);
+    if (r.unknown || r.next == now) {
+      // The shadow's value (the inactive entry leaves stream_active_ below).
+      r.active = false;
+      set(flat, now);
+    } else {
+      if (!r.active) {
+        r.active = true;
+        stream_active_.push_back(flat);
+      }
+      r.value = r.next;
+      r.shadow = now;
+    }
+  }
+  stream_touched_.clear();
+  // Over the shadow, unless the shadow changed since.
+  size_t kept = 0;
+  for (uint16_t flat : stream_active_) {
+    StreamRegister& r = stream_registers_[flat];
+    if (!r.active) {
+      continue;
+    }
+    const uint32_t now = shadow(flat);
+    if (now != r.shadow) {
+      r.active = false;
+      set(flat, now);
+      continue;
+    }
+    set(flat, r.value);
+    ++stream_override_counts_[flat];
+    stream_active_[kept++] = flat;
+  }
+  stream_active_.resize(kept);
+  ++stream_items_;
+  if (kept) {
+    ++stream_items_overridden_;
+  }
+}
+
+void Parallel::LogStreamState() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto& registers = ShadowRegisters();
+  std::vector<std::pair<uint32_t, uint32_t>> top;
+  for (uint32_t flat = 0; flat < kShadowCount; ++flat) {
+    if (stream_override_counts_[flat]) {
+      top.push_back({stream_override_counts_[flat], flat});
+    }
+  }
+  std::sort(top.rbegin(), top.rend());
+  std::string out;
+  for (size_t i = 0; i < top.size() && i < 24; ++i) {
+    const uint32_t flat = top[i].second;
+    const StreamRegister& r = stream_registers_[flat];
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), " %04X:%u", registers[flat], top[i].first);
+    out += buf;
+    if (r.active) {
+      std::snprintf(buf, sizeof(buf), "(%08X/%08X)", _byteswap_ulong(r.value),
+                    _byteswap_ulong(r.shadow));
+      out += buf;
+    }
+  }
+  REXLOG_INFO("[native stream state] 10 s: {} of {} items with registers from the command "
+              "buffer, {} now | writes outside the shadow {}, REG_RMW unknown {}, indirect "
+              "buffers {}, walks lost {} | register:items(command buffer/shadow now):{}",
+              stream_items_overridden_, stream_items_, stream_active_.size(),
+              stream_unshadowed_, stream_unknown_, stream_indirect_, stream_lost_walks_, out);
+  stream_override_counts_.fill(0);
+  stream_items_ = stream_items_overridden_ = stream_unshadowed_ = stream_unknown_ =
+      stream_indirect_ = stream_lost_walks_ = 0;
+}
 
 void Parallel::AuditStream(const uint8_t* base, uint32_t device, uint32_t from, uint32_t to,
                            bool at_draw) {
-  if (to <= from || to - from > (1u << 20)) {
+  if (to < from || to - from > (1u << 20)) {
     std::lock_guard<std::mutex> lock(g_audit_mutex);
     ++g_audit_resets;
     return;
@@ -717,51 +1081,32 @@ void Parallel::AuditStream(const uint8_t* base, uint32_t device, uint32_t from, 
     }
     REXLOG_INFO("[native audit] stream {:08X}-{:08X}:{}", from + 4, to, out);
   }
-  for (uint32_t p = from + 4, next; p + 4 <= to + 4; p = next) {
-    const uint32_t header = LoadBE32(base + p);
-    ++g_audit_packets;
-    switch (header >> 30) {
-      case 0: {
-        const uint32_t count = ((header >> 16) & 0x3FFF) + 1;
-        const uint32_t reg = header & 0x7FFF;
-        const bool one_reg = (header >> 15) & 1;
-        for (uint32_t i = 0; i < count && p + 4 + 4 * i <= to; ++i) {
-          value_written(one_reg ? reg : reg + i, LoadBE32(base + p + 4 + 4 * i));
-        }
-        next = p + 4 * (count + 1);
-        break;
-      }
-      case 1:
-        value_written(header & 0x7FF, LoadBE32(base + p + 4));
-        value_written((header >> 11) & 0x7FF, LoadBE32(base + p + 8));
-        next = p + 12;
-        break;
-      case 3: {
-        const uint32_t count = ((header >> 16) & 0x3FFF) + 1;
-        const uint32_t opcode = (header >> 8) & 0x7F;
-        if (opcode == 0x22 || opcode == 0x36) {
-          drew = true;  // DRAW_INDX(_2)
-        }
-        if ((opcode == 0x2D || opcode == 0x55) && count >= 2) {
-          // SET_CONSTANT(2): type << 16 | index, then the values.
-          const uint32_t offset_type = LoadBE32(base + p + 4);
-          static const uint32_t kBase[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
-          const uint32_t type = (offset_type >> 16) & 0xFF;
-          if (type < 5) {
-            const uint32_t first = kBase[type] + (offset_type & 0x7FF);
-            for (uint32_t i = 0; i + 1 < count; ++i) {
-              value_written(first + i, LoadBE32(base + p + 8 + 4 * i));
-            }
-          }
-        }
-        next = p + 4 * (count + 1);
-        break;
-      }
-      default:
-        next = p + 4;
-        break;
-    }
-  }
+  // (SET_CONSTANT2 and SET_SHADER_CONSTANTS take a register index, not
+  // SET_CONSTANT's type and index; REG_RMW and LOAD_ALU_CONSTANT count too.)
+  WalkPackets(base, PhysicalMemory(), from, to,
+              [&](StreamEvent event, uint32_t reg, uint32_t value, uint32_t mask) {
+                switch (event) {
+                  case StreamEvent::kPacket:
+                    ++g_audit_packets;
+                    break;
+                  case StreamEvent::kWrite:
+                    value_written(reg, value);
+                    break;
+                  case StreamEvent::kModify:
+                    if (known[reg & 0xFFFF]) {
+                      value_written(reg, (stream[reg & 0xFFFF] & mask) | value);
+                    }
+                    break;
+                  case StreamEvent::kUnknown:
+                    known[reg & 0xFFFF] = 0;
+                    break;
+                  case StreamEvent::kDraw:
+                    drew = true;
+                    break;
+                  default:
+                    break;
+                }
+              });
   if (at_draw && drew) {
     for (const ShadowGroup& g : kShadowGroups) {
       for (uint32_t i = 0; i < g.count; ++i) {
@@ -821,7 +1166,101 @@ r("""      REXLOG_INFO("[native renderer] shader load scans in 10 s: {}, vertex 
   """      if (std::getenv("NATIVE_STREAM_AUDIT")) {
         LogAudit();
       }
+      if (stream_state_) {
+        LogStreamState();
+      }
       REXLOG_INFO("[native renderer] shader load scans in 10 s: {}, vertex shader loads {}, \"""")
+
+# NATIVE_STREAM_STATE (see Parallel::ApplyStreamState): the registers Carbon's
+# library writes into the command buffer only, laid over the shadow.
+r("""// Index of VGT_INDX_OFFSET (0x2102) in the flat shadow.
+constexpr uint32_t kIndexOffsetFlat = 16 + 2;""",
+  """// Index of VGT_INDX_OFFSET (0x2102) in the flat shadow.
+constexpr uint32_t kIndexOffsetFlat = 16 + 2;
+// Index of fetch constant 95 (0x48BE, stream 0) in the flat shadow.
+constexpr uint32_t kFetch95Flat = kAluConstantsFlat + 2048 + 190;
+static_assert(kDeviceFetch95 == 1024 + 4 * 190, "fetch constant 95 in the 0x4800 group");
+
+// NATIVE_STREAM_STATE_REGISTERS=<hex>[-<hex>],...: the registers
+// NATIVE_STREAM_STATE takes from the command buffer (all of the shadow's
+// without it).
+std::vector<bool> StreamAllowed() {
+  const auto& registers = ShadowRegisters();
+  const char* v = std::getenv("NATIVE_STREAM_STATE_REGISTERS");
+  std::vector<bool> allowed(kShadowCount, v == nullptr);
+  for (const char* p = v; p && *p;) {
+    char* end;
+    const unsigned long first = std::strtoul(p, &end, 16);
+    if (end == p) {
+      break;
+    }
+    unsigned long last = first;
+    p = end;
+    if (*p == '-') {
+      last = std::strtoul(p + 1, &end, 16);
+      p = end;
+    }
+    for (uint32_t flat = 0; flat < kShadowCount; ++flat) {
+      if (registers[flat] >= first && registers[flat] <= last) {
+        allowed[flat] = true;
+      }
+    }
+    while (*p == ',' || *p == ' ') {
+      ++p;
+    }
+  }
+  return allowed;
+}""")
+r("""  uint64_t scanned_vs_hash_ = 0;""",
+  """  uint64_t scanned_vs_hash_ = 0;
+  // NATIVE_STREAM_STATE (mask: 1 draws, 2 resolves; mutex_ held): the
+  // register writes the walks saw that no item took yet (value and mask as
+  // read, event a StreamEvent), the end of those before the current item's
+  // last draw packet (-1: none seen), and per register of the shadow the
+  // command buffer's value where it differs from the shadow's (big-endian).
+  void ApplyStreamState(Frame& f, const uint8_t* device);
+  const int stream_state_ = [] {
+    const char* v = std::getenv("NATIVE_STREAM_STATE");
+    return v ? std::atoi(v) & 3 : 0;
+  }();
+  struct StreamWrite {
+    uint16_t flat;
+    uint8_t event;
+    uint32_t value, mask;
+  };
+  std::vector<StreamWrite> stream_writes_;
+  int64_t stream_draw_mark_ = -1;
+  struct StreamRegister {
+    // The command buffer's value, and the shadow's when it was written.
+    uint32_t value = 0, shadow = 0;
+    // While an item takes the writes.
+    uint32_t next = 0;
+    bool active = false, touched = false, unknown = false;
+  };
+  std::array<StreamRegister, kShadowCount> stream_registers_ = {};
+  std::vector<uint16_t> stream_active_, stream_touched_;
+  // A walk was lost (the write pointer moved to another segment unseen).
+  bool stream_lost_ = false;
+  const std::vector<bool> stream_allowed_ = StreamAllowed();
+  // For the log every 10 s.
+  std::array<uint32_t, kShadowCount> stream_override_counts_ = {};
+  uint64_t stream_items_ = 0, stream_items_overridden_ = 0, stream_unshadowed_ = 0,
+           stream_unknown_ = 0, stream_indirect_ = 0, stream_lost_walks_ = 0;""")
+r("""      last_shadow_[kIndexOffsetFlat] = value;
+    }
+  }
+  if (draw) {
+    item.primitive_type = args[1];""",
+  """      last_shadow_[kIndexOffsetFlat] = value;
+    }
+  }
+  // NATIVE_STREAM_STATE: the registers the library wrote into the command
+  // buffer only.
+  if (stream_state_ & (draw ? 1 : 2)) {
+    ApplyStreamState(f, device);
+  }
+  if (draw) {
+    item.primitive_type = args[1];""")
 
 for old, new in R:
     c = t.count(old)

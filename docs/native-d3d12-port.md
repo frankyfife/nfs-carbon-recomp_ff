@@ -113,6 +113,116 @@ load scan counts.
 Status: the title screen renders correctly through the native renderer (also with
 `native_renderer_skip_emulation`, at 2x scale: 2560x1440). Menus, races and free roam not verified yet.
 
+## Registers from the command buffer: `NATIVE_STREAM_STATE` (2026-10-13, not tested yet)
+
+`NATIVE_STREAM_AUDIT=1` showed that Carbon's library also writes state the shadow never sees. It writes
+type-0 packets for the **vertex fetch constants of streams 0-2 (0x48BA-0x48BF)**: with the type bits, which
+the shadow lacks (`17A5FC83` against `17A5FC80`), and for streams 1-2 not equal to the shadow.
+
+It also writes type-0 packets to 0x5000-0x5002. These are `SHADER_CONSTANT_FLUSH_FETCH_0-2` in the SDK's
+register table: a mask of the fetch constants that changed, not state, and ignored here.
+
+Further mismatches at draw time: 0x47F0-0x47FF, 0x2305-0x2308 (`PA_CL_GB_HORZ_*_ADJ`, `SQ_VS_CONST`,
+`SQ_PS_CONST`), 0x2316/0x2317 (`VGT_VERTEX_REUSE_BLOCK_CNTL`, `VGT_OUT_DEALLOC_CNTL`) and 0x2324
+(`RB_SAMPLE_COUNT_CTL`).
+
+**How the recorder takes them.** With `NATIVE_STREAM_STATE=<mask>` (1 draws, 2 resolves, 3 both):
+
+1. **Walks.** The hooks walk what the library wrote between two hooked calls (`RecordCall`; a segment
+   change ends a walk with the rest of the old segment). They collect the register writes as the SDK's
+   command processor makes them: type 0 and 1, `SET_CONSTANT`, `SET_CONSTANT2`/`SET_SHADER_CONSTANTS`
+   (register index), `LOAD_ALU_CONSTANT` (values from memory), and `REG_RMW`.
+2. **At each recorded item:**
+   - the writes before its last draw packet are laid over the shadow;
+   - the writes after it (state the library sets after the draw) wait for the next item.
+3. **How long a value holds.** A register keeps the command buffer's value until the command buffer
+   writes it again, or the shadow changes (a Set call the command buffer has not shown yet). Then the
+   shadow's value comes back.
+4. **Lost walks.** If a walk is lost (the write pointer moved to another segment unseen), every register
+   goes back to the shadow's value.
+
+Only registers of the shadow groups are taken. `NATIVE_STREAM_STATE_REGISTERS=48BA-48BF,2102` narrows the
+set (hex, ranges), for finding out which registers matter. The DrawVertices vertex copies read the stream
+fetch constants as recorded (so with the command buffer's values).
+
+Every 10 s the log has a line `[native stream state]` with:
+
+- the items that got registers from the command buffer;
+- the registers most often taken, with the command buffer's and the shadow's value;
+- writes outside the shadow, unknown `REG_RMW`s, indirect buffers (not followed), and lost walks.
+
+**Audit fix.** The audit now uses the same walker. Before, it read `SET_CONSTANT2` (0x55) like
+`SET_CONSTANT`, as type and index; it takes an absolute register index. It also did not count
+`SET_SHADER_CONSTANTS`, `LOAD_ALU_CONSTANT` or `REG_RMW`.
+
+**Checked here** (Linux, against stub headers, since the cloud has no Windows or SDK build):
+
+- a synthetic command buffer through the real hooks, with ASan/UBSan: stream values over the shadow, writes
+  after the draw packet for the next item, shadow changes, `SET_CONSTANT2`, `SET_CONSTANT` type 1,
+  `LOAD_ALU_CONSTANT`, resolves, lost walks;
+- the recorded change list replays to the recorder's register file;
+- without the variable, nothing changes.
+
+**To test on the PC:**
+
+1. `NATIVE_STREAM_STATE=1`, then 3, against without, in the main menu and a race, with `run_menu.ps1` and
+   `NATIVE_SAVE_FRONT`.
+2. Read the `[native stream state]` lines.
+3. If a register makes things worse, narrow the set with `NATIVE_STREAM_STATE_REGISTERS`.
+
+## Formats (2026-10-13)
+
+**Render targets** (`ColorFormat`):
+
+| Guest format | Host format |
+|---|---|
+| 8_8_8_8 (and GAMMA) | R8G8B8A8 |
+| 2_10_10_10 (and AS_10_10_10_10) | R10G10B10A2 |
+| 16_16, 16_16_16_16 | SNORM |
+| 16_16_FLOAT | R16G16_FLOAT |
+| 32_FLOAT | R32_FLOAT |
+| 32_32_FLOAT | R32G32_FLOAT |
+| everything else: 2_10_10_10_FLOAT (7e3), 2_10_10_10_FLOAT_AS_16_16_16_16, 16_16_16_16_FLOAT | R16G16B16A16_FLOAT, as in the SDK without ROV |
+
+- **New:** the SDK divides the output for 16_16 and 16_16_16_16 by 32 (`color_exp_bias - 5`), because they
+  are -32...32 on the guest and -1...1 as SNORM. MW's renderer did not, so values above 1/32 were clipped.
+  Resolves of such a target multiply by 32 again.
+
+**Resolves.** Every copy was R8G8B8A8 (depth: R32_FLOAT), whatever the game copied, so float/HDR targets
+lost everything outside 0-1. Now:
+
+- **Destination format.** The destination has the copy's format (`RB_COPY_DEST_INFO.copy_dest_format`):
+  8, 8_8, 2_10_10_10, 16, 16_16, 16_16_16_16 (UNORM), 16 to 16_16_16_16 FLOAT, 32 to 32_32_32_32 FLOAT.
+  Formats without a host render target format stay R8G8B8A8.
+- **Exponent bias.** The copy's exponent bias (`copy_dest_exp_bias`) is applied (it was ignored).
+- **Pipelines.** Resolve pipelines are made per destination format.
+- **Write-back.** `WriteBackSmallResolves` (the copies the CPU reads, such as the exposure) also writes back
+  4- and 8-byte formats. They are written as the first texel of each block at a scale; R8G8B8A8 is still
+  averaged.
+- **Old behaviour.** `NATIVE_RESOLVE_RGBA8=1` restores it, for comparing.
+
+**Textures** (`TextureFormat`):
+
+- Before, only these 16 were handled: DXT1/2_3/4_5, 8, 8_8, 5_6_5, 1_5_5_5, 4_4_4_4, 8_8_8_8, 2_10_10_10,
+  16_16, 16_16_16_16, 16_FLOAT, 16_16_FLOAT, 16_16_16_16_FLOAT and 32_FLOAT.
+- **New**, formats the SDK's D3D12 texture cache also copies unchanged:
+  - 8_A;
+  - 8_8_8_8_AS_16_16_16_16, DXT1/DXT2_3/DXT4_5_AS_16_16_16_16 and 2_10_10_10_AS_16_16_16_16 (only the
+    filtering precision differs);
+  - DXN (BC5, normal maps) and DXT5A (BC4);
+  - 16 (UNORM);
+  - 16_EXPAND, 16_16_EXPAND and 16_16_16_16_EXPAND (FLOAT);
+  - 32_32_FLOAT and 32_32_32_32_FLOAT.
+- **Still missing**, because they need a conversion (the SDK's load shaders):
+  - 24_8 and 24_8_FLOAT (depth sampled as a texture: shadow maps, unless they come from a resolve);
+  - 10_11_11 and 11_11_10 (with their AS_16_16_16_16 variants);
+  - CTX1, DXT3A, 6_5_5, Y1_Cr_Y0_Cb_REP and Cr_Y1_Cb_Y0_REP.
+
+  Each one prints `unsupported texture: format N` (N is `xenos::TextureFormat`). The 10 s log counts them.
+  The next step is to collect the numbers Carbon prints.
+
+`renderer.cpp` was identical to MW's until these changes; they are the first Carbon-side changes in it.
+
 ## Plan
 
 1. Copy `renderer.{h,cpp}`, `guest.h`, `sdk_cvars_local.h` from MW; adapt `parallel.cpp` to the tables

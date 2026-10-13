@@ -162,8 +162,87 @@ TextureFormatInfo TextureFormat(xenos::TextureFormat f) {
       return {DXGI_FORMAT_R16G16B16A16_FLOAT, false};
     case xenos::TextureFormat::k_32_FLOAT:
       return {DXGI_FORMAT_R32_FLOAT, false, kSwizzleRRRR};
+    // Formats whose data the SDK's texture cache also copies unchanged (its
+    // 8 to 128 bpb load shaders; Carbon's newer XDK uses them where MW did
+    // not, e.g. DXN normal maps and the _AS_16_16_16_16 variants, which only
+    // differ in filtering precision).
+    case xenos::TextureFormat::k_8_A:
+      return {DXGI_FORMAT_R8_UNORM, false, kSwizzleRRRR};
+    case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16:
+      return {DXGI_FORMAT_R8G8B8A8_UNORM, false};
+    case xenos::TextureFormat::k_DXT1_AS_16_16_16_16:
+      return {DXGI_FORMAT_BC1_UNORM, true};
+    case xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16:
+      return {DXGI_FORMAT_BC2_UNORM, true};
+    case xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16:
+      return {DXGI_FORMAT_BC3_UNORM, true};
+    case xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16:
+      return {DXGI_FORMAT_R10G10B10A2_UNORM, false};
+    case xenos::TextureFormat::k_DXN:
+      return {DXGI_FORMAT_BC5_UNORM, true, kSwizzleRGGG};
+    case xenos::TextureFormat::k_DXT5A:
+      return {DXGI_FORMAT_BC4_UNORM, true, kSwizzleRRRR};
+    case xenos::TextureFormat::k_16:
+      return {DXGI_FORMAT_R16_UNORM, false, kSwizzleRRRR};
+    case xenos::TextureFormat::k_16_EXPAND:
+      return {DXGI_FORMAT_R16_FLOAT, false, kSwizzleRRRR};
+    case xenos::TextureFormat::k_16_16_EXPAND:
+      return {DXGI_FORMAT_R16G16_FLOAT, false, kSwizzleRGGG};
+    case xenos::TextureFormat::k_16_16_16_16_EXPAND:
+      return {DXGI_FORMAT_R16G16B16A16_FLOAT, false};
+    case xenos::TextureFormat::k_32_32_FLOAT:
+      return {DXGI_FORMAT_R32G32_FLOAT, false, kSwizzleRGGG};
+    case xenos::TextureFormat::k_32_32_32_32_FLOAT:
+      return {DXGI_FORMAT_R32G32B32A32_FLOAT, false};
     default:
       return {DXGI_FORMAT_UNKNOWN, false};
+  }
+}
+
+// Host format of a resolve destination: the copy's format
+// (RB_COPY_DEST_INFO), which the game samples it as. Carbon copies float
+// render targets (HDR) into float textures; as R8G8B8A8, which every copy was
+// before 2026-10-13, they lost everything outside 0-1. Formats without such a
+// host render target format (5_6_5, 10_11_11, ...) stay R8G8B8A8; so do all
+// with NATIVE_RESOLVE_RGBA8=1 (for comparing).
+struct ResolveFormatInfo {
+  DXGI_FORMAT format;
+  uint32_t host_swizzle;
+  uint32_t texel_bytes;
+};
+ResolveFormatInfo ResolveFormat(xenos::ColorFormat f) {
+  static const bool rgba8_only = std::getenv("NATIVE_RESOLVE_RGBA8") != nullptr;
+  if (rgba8_only) {
+    return {DXGI_FORMAT_R8G8B8A8_UNORM, kSwizzleRGBA, 4};
+  }
+  switch (f) {
+    case xenos::ColorFormat::k_8:
+      return {DXGI_FORMAT_R8_UNORM, kSwizzleRRRR, 1};
+    case xenos::ColorFormat::k_8_8:
+      return {DXGI_FORMAT_R8G8_UNORM, kSwizzleRGGG, 2};
+    case xenos::ColorFormat::k_2_10_10_10:
+    case xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16:
+      return {DXGI_FORMAT_R10G10B10A2_UNORM, kSwizzleRGBA, 4};
+    case xenos::ColorFormat::k_16:
+      return {DXGI_FORMAT_R16_UNORM, kSwizzleRRRR, 2};
+    case xenos::ColorFormat::k_16_16:
+      return {DXGI_FORMAT_R16G16_UNORM, kSwizzleRGGG, 4};
+    case xenos::ColorFormat::k_16_16_16_16:
+      return {DXGI_FORMAT_R16G16B16A16_UNORM, kSwizzleRGBA, 8};
+    case xenos::ColorFormat::k_16_FLOAT:
+      return {DXGI_FORMAT_R16_FLOAT, kSwizzleRRRR, 2};
+    case xenos::ColorFormat::k_16_16_FLOAT:
+      return {DXGI_FORMAT_R16G16_FLOAT, kSwizzleRGGG, 4};
+    case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+      return {DXGI_FORMAT_R16G16B16A16_FLOAT, kSwizzleRGBA, 8};
+    case xenos::ColorFormat::k_32_FLOAT:
+      return {DXGI_FORMAT_R32_FLOAT, kSwizzleRRRR, 4};
+    case xenos::ColorFormat::k_32_32_FLOAT:
+      return {DXGI_FORMAT_R32G32_FLOAT, kSwizzleRGGG, 8};
+    case xenos::ColorFormat::k_32_32_32_32_FLOAT:
+      return {DXGI_FORMAT_R32G32B32A32_FLOAT, kSwizzleRGBA, 16};
+    default:
+      return {DXGI_FORMAT_R8G8B8A8_UNORM, kSwizzleRGBA, 4};
   }
 }
 
@@ -393,7 +472,8 @@ Texture2D<float4> source : register(t0);
 cbuffer Constants : register(b0) {
   int2 source_offset;  // source pixel = dest pixel + source_offset
   uint sample_select;  // xenos::CopySampleSelect
-  uint flags;          // 1 = swap red and blue; bits 8-15: the source's samples
+  uint flags;          // 1 = swap red and blue, 2 = source k_16_16(_16_16) (stored / 32);
+                       // bits 8-15: the source's samples; 16-21: exponent bias (signed)
 };
 float4 Load(int2 p, int s) {
 #if MSAA
@@ -429,6 +509,10 @@ float4 PSMain(float4 position : SV_Position) : SV_Target {
 #else
   c = Load(p, 0);
 #endif
+  if (flags & 2) {
+    c *= 32.0;
+  }
+  c *= exp2(float(int(flags << 10) >> 26));
   if (flags & 1) {
     c = c.bgra;
   }
@@ -477,6 +561,9 @@ struct Renderer::HostTexture {
   uint32_t guest_fetch[6] = {};
   uint64_t resolved_frame = 0;
   ComPtr<ID3D12Resource> readback;  // for WriteBackSmallResolves
+  // Resolve destinations of a colour source: bytes per texel of the guest
+  // format it holds (0: not written back).
+  uint32_t writeback_bytes = 0;
 };
 
 struct Renderer::Pipeline {
@@ -669,37 +756,49 @@ bool Renderer::CreateResolvePipelines() {
   }
   for (int msaa = 0; msaa < 2; ++msaa) {
     D3D_SHADER_MACRO defines[] = {{"MSAA", msaa ? "1" : "0"}, {nullptr, nullptr}};
-    ComPtr<ID3DBlob> vs, ps;
     if (FAILED(D3DCompile(kResolveShaders, sizeof(kResolveShaders) - 1, "resolve", defines,
-                          nullptr, "VSMain", "vs_5_0", 0, 0, &vs, &error)) ||
+                          nullptr, "VSMain", "vs_5_0", 0, 0, &resolve_vs_[msaa], &error)) ||
         FAILED(D3DCompile(kResolveShaders, sizeof(kResolveShaders) - 1, "resolve", defines,
-                          nullptr, "PSMain", "ps_5_0", 0, 0, &ps, &error))) {
+                          nullptr, "PSMain", "ps_5_0", 0, 0, &resolve_ps_[msaa], &error))) {
       std::fprintf(stderr, "resolve shader: %s\n",
                    error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
       return false;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
-    pso.pRootSignature = resolve_root_signature_.Get();
-    pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-    pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pso.SampleMask = UINT_MAX;
-    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pso.RasterizerState.DepthClipEnable = TRUE;
-    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.NumRenderTargets = 1;
-    pso.SampleDesc.Count = 1;
-    const DXGI_FORMAT formats[2] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT};
-    for (int f = 0; f < 2; ++f) {
-      pso.RTVFormats[0] = formats[f];
-      if (FAILED(device_->CreateGraphicsPipelineState(&pso,
-                                                      IID_PPV_ARGS(&resolve_color_[msaa][f])))) {
+    // The ones every frame needs (the others when first used).
+    for (DXGI_FORMAT format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT}) {
+      if (!ResolvePipeline(msaa != 0, format)) {
         return false;
       }
     }
   }
   return true;
+}
+
+// The resolve pipeline drawing into a destination of this format.
+ID3D12PipelineState* Renderer::ResolvePipeline(bool msaa, DXGI_FORMAT format) {
+  ComPtr<ID3D12PipelineState>& pipeline = resolve_pipelines_[{msaa ? 1 : 0, format}];
+  if (pipeline) {
+    return pipeline.Get();
+  }
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+  pso.pRootSignature = resolve_root_signature_.Get();
+  pso.VS = {resolve_vs_[msaa]->GetBufferPointer(), resolve_vs_[msaa]->GetBufferSize()};
+  pso.PS = {resolve_ps_[msaa]->GetBufferPointer(), resolve_ps_[msaa]->GetBufferSize()};
+  pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pso.SampleMask = UINT_MAX;
+  pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pso.RasterizerState.DepthClipEnable = TRUE;
+  pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pso.NumRenderTargets = 1;
+  pso.RTVFormats[0] = format;
+  pso.SampleDesc.Count = 1;
+  if (FAILED(device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&pipeline)))) {
+    std::fprintf(stderr, "resolve pipeline for format %u failed\n", uint32_t(format));
+    pipeline.Reset();
+    return nullptr;
+  }
+  return pipeline.Get();
 }
 
 void Renderer::Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES& current,
@@ -2009,8 +2108,14 @@ void Renderer::Draw(const DrawCall& d) {
     if (color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
       flags |= DxbcShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
     }
-    system.color_exp_bias[i] =
-        std::ldexp(1.0f, int(color_info.color_exp_bias));
+    // k_16_16(_16_16) are -32...32 on the guest and SNORM -1...1 on the host:
+    // the output is divided by 32 (as the SDK does without ROV).
+    int exp_bias = int(color_info.color_exp_bias);
+    if (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
+        color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16) {
+      exp_bias -= 5;
+    }
+    system.color_exp_bias[i] = std::ldexp(1.0f, exp_bias);
   }
   system.flags = flags;
   system.vertex_index_endian =
@@ -2523,7 +2628,15 @@ void Renderer::Resolve(const ResolveCall& r) {
   const uint32_t height = (((f[2] >> 13) & 0x1FFF) + 1) * scale_;
   const bool cube = ((f[5] >> 9) & 3) == 3;
   const uint32_t array_size = cube ? 6 : 1;
-  const DXGI_FORMAT format = source->depth ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+  const auto dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
+  const ResolveFormatInfo dest_format =
+      source->depth ? ResolveFormatInfo{DXGI_FORMAT_R32_FLOAT, kSwizzleRRRR, 0}
+                    : ResolveFormat(dest_info.copy_dest_format);
+  const DXGI_FORMAT format = dest_format.format;
+  ID3D12PipelineState* pipeline = ResolvePipeline(source->samples > 1, format);
+  if (!pipeline) {
+    return;
+  }
   auto& dest = resolved_[base];
   if (!dest || dest->width != width || dest->height != height || dest->format != format ||
       dest->array_size != array_size) {
@@ -2533,7 +2646,7 @@ void Renderer::Resolve(const ResolveCall& r) {
     dest->height = height;
     dest->array_size = array_size;
     dest->mips = 1;
-    dest->host_swizzle = source->depth ? kSwizzleRRRR : kSwizzleRGBA;
+    dest->host_swizzle = dest_format.host_swizzle;
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width;
@@ -2569,6 +2682,7 @@ void Renderer::Resolve(const ResolveCall& r) {
   }
   std::memcpy(dest->guest_fetch, r.dest_fetch, sizeof(dest->guest_fetch));
   dest->resolved_frame = frame_;
+  dest->writeback_bytes = dest_format.texel_bytes;
   dest->scaled = scale_ > 1;
   if (std::find(resolve_order_.begin(), resolve_order_.end(), base) == resolve_order_.end()) {
     resolve_order_.push_back(base);
@@ -2594,12 +2708,16 @@ void Renderer::Resolve(const ResolveCall& r) {
     srv.Texture2D.MipLevels = 1;
   }
   device_->CreateShaderResourceView(source->resource.Get(), &srv, cpu);
-  const uint32_t dest_info = regs[XE_GPU_REG_RB_COPY_DEST_INFO];
+  // Colour: red and blue swapped, k_16_16(_16_16) stored as SNORM / 32 (see
+  // the colour exponent bias of the draws), the copy's exponent bias.
+  const bool fixed16 = source->srv_format == DXGI_FORMAT_R16G16_SNORM ||
+                       source->srv_format == DXGI_FORMAT_R16G16B16A16_SNORM;
+  const uint32_t color_flags = dest_info.copy_dest_swap | (fixed16 ? 2u : 0u) |
+                               ((uint32_t(dest_info.copy_dest_exp_bias) & 0x3F) << 16);
   const uint32_t constants[4] = {uint32_t(left - dest_x), uint32_t(top - dest_y),
                                  source->depth ? 0u : sample_select,
-                                 (source->depth ? 0u : ((dest_info >> 24) & 1)) |
-                                     (source->samples << 8)};
-  list_->SetPipelineState(resolve_color_[source->samples > 1][source->depth ? 1 : 0].Get());
+                                 (source->depth ? 0u : color_flags) | (source->samples << 8)};
+  list_->SetPipelineState(pipeline);
   list_->SetGraphicsRootSignature(resolve_root_signature_.Get());
   list_->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
   list_->SetGraphicsRootDescriptorTable(1, gpu);
@@ -3246,12 +3364,17 @@ uint32_t Renderer::WriteBackSmallResolves(uint8_t* guest_memory, uint32_t max_by
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
     uint32_t fetch[6];
     uint32_t width, height;
+    uint32_t bytes;
+    bool average;
   };
   std::vector<Pending> pending;
   for (auto& [base, texture] : resolved_) {
-    if (!texture || texture->resolved_frame != frame_ ||
-        texture->format != DXGI_FORMAT_R8G8B8A8_UNORM || texture->array_size != 1 ||
-        (texture->width / scale_) * (texture->height / scale_) * 4 > max_bytes) {
+    // Colour copies of 4 and 8 bytes per texel (R8G8B8A8 averaged at a
+    // scale, the others the first texel of each block).
+    const uint32_t bytes = texture ? texture->writeback_bytes : 0;
+    if (!texture || texture->resolved_frame != frame_ || (bytes != 4 && bytes != 8) ||
+        texture->array_size != 1 ||
+        (texture->width / scale_) * (texture->height / scale_) * bytes > max_bytes) {
       continue;
     }
     D3D12_RESOURCE_DESC desc = texture->resource->GetDesc();
@@ -3293,6 +3416,8 @@ uint32_t Renderer::WriteBackSmallResolves(uint8_t* guest_memory, uint32_t max_by
     // The guest's size; at a scale, each guest texel is the mean of its block.
     p.width = texture->width / scale_;
     p.height = texture->height / scale_;
+    p.bytes = bytes;
+    p.average = texture->format == DXGI_FORMAT_R8G8B8A8_UNORM;
     p.texture = nullptr;
     pending.push_back(std::move(p));
   }
@@ -3313,7 +3438,8 @@ uint32_t Renderer::WriteBackSmallResolves(uint8_t* guest_memory, uint32_t max_by
     std::memcpy(&fetch, p.fetch, sizeof(fetch));
     const uint32_t base = GuestToPhysical(p.fetch[1] & 0xFFFFF000);
     const uint32_t pitch_texels = std::max<uint32_t>(fetch.pitch, 1) * 32;
-    if (!Readable(base, pitch_texels * ((t.height + 31) & ~31u) * 4)) {
+    const uint32_t bytes = p.bytes;
+    if (!Readable(base, pitch_texels * ((t.height + 31) & ~31u) * bytes)) {
       continue;
     }
     const uint8_t* data;
@@ -3325,9 +3451,32 @@ uint32_t Renderer::WriteBackSmallResolves(uint8_t* guest_memory, uint32_t max_by
       for (uint32_t x = 0; x < t.width; ++x) {
         const uint32_t offset =
             fetch.tiled ? uint32_t(texture_util::GetTiledOffset2D(int32_t(x), int32_t(y),
-                                                                 pitch_texels, 2))
-                        : (y * pitch_texels + x) * 4;
-        if (uint64_t(base) + offset + 4 > kSharedMemorySize) {
+                                                                 pitch_texels, bytes == 8 ? 3 : 2))
+                        : (y * pitch_texels + x) * bytes;
+        if (uint64_t(base) + offset + bytes > kSharedMemorySize) {
+          continue;
+        }
+        if (!p.average) {
+          // The block's first texel, each 32 bits in the guest's byte order.
+          const uint8_t* texel =
+              data + size_t(y * scale) * p.footprint.Footprint.RowPitch + size_t(bytes) * x * scale;
+          uint8_t* out = guest_memory + base + offset;
+          for (uint32_t u = 0; u < bytes; u += 4) {
+            const uint8_t* in = texel + u;
+            switch (fetch.endianness) {
+              case xenos::Endian::k8in32:
+                out[u] = in[3], out[u + 1] = in[2], out[u + 2] = in[1], out[u + 3] = in[0];
+                break;
+              case xenos::Endian::k16in32:
+                out[u] = in[2], out[u + 1] = in[3], out[u + 2] = in[0], out[u + 3] = in[1];
+                break;
+              case xenos::Endian::k8in16:
+                out[u] = in[1], out[u + 1] = in[0], out[u + 2] = in[3], out[u + 3] = in[2];
+                break;
+              default:
+                std::memcpy(out + u, in, 4);
+            }
+          }
           continue;
         }
         // Host R8G8B8A8 back into the guest's byte order.

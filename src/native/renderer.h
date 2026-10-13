@@ -296,6 +296,7 @@ class Renderer {
                           ID3D12Resource** buffer = nullptr, uint64_t* offset = nullptr);
   D3D12_GPU_DESCRIPTOR_HANDLE AllocateViews(uint32_t count, D3D12_CPU_DESCRIPTOR_HANDLE& cpu);
   bool CreateResolvePipelines();
+  ID3D12PipelineState* ResolvePipeline(bool msaa, DXGI_FORMAT format);
   void ActivateSet(uint32_t index);
   // Runs once the GPU finished the commands recorded so far.
   void AfterCompletion(std::function<void()> work) {
@@ -408,7 +409,9 @@ class Renderer {
   std::vector<uint32_t> resolve_order_;
 
   ComPtr<ID3D12RootSignature> resolve_root_signature_;
-  ComPtr<ID3D12PipelineState> resolve_color_[2][2];  // [msaa][format r8g8b8a8 / r32f]
+  // Resolve shaders [msaa], and pipelines by (msaa, destination format).
+  ComPtr<ID3DBlob> resolve_vs_[2], resolve_ps_[2];
+  std::map<std::pair<int, DXGI_FORMAT>, ComPtr<ID3D12PipelineState>> resolve_pipelines_;
   ComPtr<ID3D12PipelineState> resolve_depth_[2];      // [msaa] -> r32f
 
   bool Readable(uint32_t address, uint32_t size);
